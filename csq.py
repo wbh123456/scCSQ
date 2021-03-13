@@ -1,0 +1,284 @@
+import torch
+from torchvision import models
+from torch import nn
+import pytorch_lightning as pl
+from torch.optim import lr_scheduler
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, random_split, Subset, Dataset
+from torch.nn import functional as F
+from torchvision import datasets, transforms
+import torch.optim as optim
+import os
+from tqdm import tqdm
+from pytorch_lightning.callbacks import ModelCheckpoint
+from collections import Counter
+import statistics
+from torchvision.datasets.utils import download_and_extract_archive
+import pandas as pd
+import numpy as np
+from sklearn import preprocessing
+from sklearn.metrics import f1_score
+# from ray.tune.integration.pytorch_lightning import TuneReportCallback
+# from ray import tune
+# from ray.tune import CLIReporter
+import shutil
+import fairscale
+
+# Make tqdm module to print in a 1 line
+from functools import partial
+tqdm = partial(tqdm, position=0, leave=True)
+
+from util import *
+from dataModule import *
+
+def get_class_balance_loss_weight(samples_in_each_class, n_class, beta=0.9999):
+    # Class-Balanced Loss on Effective Number of Samples
+    # Reference Paper https://arxiv.org/abs/1901.05555
+    weight = (1 - beta)/(1 - torch.pow(beta, samples_in_each_class))
+    weight = weight / weight.sum() * n_class
+    return weight
+
+def test_class_balance_loss():
+  print("Testing class balance loss...")
+  # Sample 1
+  samples_in_each_class, n_class = torch.tensor([15,10,10,10,19]), 5
+  corr1 = torch.tensor([0.79511815,1.1923454,1.1923454,1.1923454,0.6278458])
+  ans1 = get_class_balance_loss_weight(samples_in_each_class, n_class)
+  if np.array_equal(corr1.numpy(), ans1.numpy()): print("Test 1 passes")
+  else: print("Test1 failed", "ans1 =",ans1.numpy(), "correct1 =",corr1.numpy())
+
+  # Sample 2
+  samples_in_each_class, n_class = torch.tensor([1,1,1,1,1]), 5
+  corr2 = torch.tensor([1.,1.,1.,1.,1.])
+  ans2 = get_class_balance_loss_weight(samples_in_each_class, n_class)
+  if np.array_equal(corr2.numpy(), ans2.numpy()): print("Test 2 passes")
+  else: print("Test2 failed", "ans2 =",ans2.numpy(), "correct2 =",corr2.numpy())
+
+  # Sample 3
+  samples_in_each_class, n_class = torch.tensor([1,2,4,8,16]), 5
+  corr3 = torch.tensor([2.5801828,1.2904761,0.64523804,0.32269114,0.16141175])
+  ans3 = get_class_balance_loss_weight(samples_in_each_class, n_class)
+  if np.array_equal(corr3.numpy(), ans3.numpy()): print("Test 3 passes")
+  else: print("Test3 failed", "ans3 =",ans3.numpy(), "correct3 =",corr3.numpy())
+
+  return
+
+###------------------------------Model---------------------------------------###
+TOP_K = 5
+
+class CSQLightening(pl.LightningModule):
+  def __init__(self,n_class,n_features,batch_size=64,l_r=1e-5,lamb_da=0.0001,beta=0.9999,bit=64):
+    super(CSQLightening, self).__init__()
+    print("hparam: l_r = {}, lambda = {}, beta = {}", l_r, lamb_da, beta)
+    self.batch_size = batch_size
+    self.l_r = l_r
+    self.bit = bit
+    self.n_class = n_class
+    self.lamb_da = lamb_da
+    self.beta = beta
+    self.samples_in_each_class = None # Later initialized in training step
+    self.hash_centers = get_hash_centers(self.n_class, self.bit)
+    ##### model structure ####
+    # input size = batch size * 19791
+    self.hash_layer = nn.Sequential(
+        nn.Linear(n_features, 9000),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Linear(9000, 3150),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Linear(3150, 900),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Linear(900, 450),
+        nn.ReLU(inplace=True),
+        nn.Linear(450, 200),
+        nn.ReLU(inplace=True),
+        nn.Linear(200, self.bit),
+    )
+    
+
+  def forward(self, x):
+    # forward pass returns prediction 
+      x = self.hash_layer(x)
+      return x
+
+  def get_class_balance_loss_weight(samples_in_each_class, n_class, beta=0.9999):
+    # Class-Balanced Loss on Effective Number of Samples
+    # Reference Paper https://arxiv.org/abs/1901.05555
+    weight = (1 - beta)/(1 - torch.pow(beta, samples_in_each_class))
+    weight = weight / weight.sum() * n_class
+    return weight
+
+  def CSQ_loss_function(self, hash_codes, labels):
+    hash_codes = hash_codes.tanh()
+    hash_centers = self.hash_centers[labels]
+    hash_centers = hash_centers.type_as(hash_codes)
+
+    if self.samples_in_each_class == None: 
+      self.samples_in_each_class = self.trainer.datamodule.samples_in_each_class
+      self.n_class = self.trainer.datamodule.N_CLASS
+
+    weight = get_class_balance_loss_weight(self.samples_in_each_class, self.n_class, self.beta)
+    weight = weight[labels]
+    weight = weight.type_as(hash_codes)
+
+    # Center Similarity Loss
+    BCELoss = nn.BCELoss(weight=weight.unsqueeze(1).repeat(1,self.bit))
+    C_loss = BCELoss(0.5 * (hash_codes + 1), 
+                        0.5 * (hash_centers + 1))
+    # Quantization Loss
+    Q_loss = (hash_codes.abs() - 1).pow(2).mean()
+
+    loss = C_loss + self.lamb_da * Q_loss
+    return loss
+
+  def training_step(self, train_batch, batch_idx):
+      data, labels = train_batch
+      hash_codes = self.forward(data)
+      loss = self.CSQ_loss_function(hash_codes, labels)
+
+      # Log template
+      # self.log('my_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+      # 在这里，好像loss本身就会被记录并且显示在progress bar里，
+      # 所以"Train_loss_step"我就不在progress bar里显示了，只在tensor board里面显示
+      self.log("Train_loss_step", loss, logger=True)
+      return loss
+
+  # def training_epoch_end(self, outputs):
+  #     train_loss_epoch = torch.stack([x['loss'] for x in outputs]).mean()
+
+  #     database_dataloader = self.trainer.datamodule.database_dataloader
+  #     train_dataloader = self.trainer.datamodule.train_dataloader()
+
+
+  #     if not self.trainer.running_sanity_check:
+  #         print(f"Epoch: {self.current_epoch}, Train_loss_epoch: {train_loss_epoch:.2f}, Train_MAP_epoch: {train_mAP:.3f}")
+
+  #     value = {"Train_loss_epoch": train_loss_epoch, "Train_MAP_epoch": train_mAP}
+  #     self.log_dict(value, prog_bar=True, logger=True, on_epoch=True)
+
+
+  def validation_step(self, val_batch, batch_idx):
+      data, labels = val_batch
+      hash_codes = self.forward(data)
+      loss = self.CSQ_loss_function(hash_codes, labels)
+      
+      return loss
+
+  def validation_epoch_end(self, outputs):
+
+      val_loss_epoch = torch.stack([x for x in outputs]).mean()
+
+      database_dataloader = self.trainer.datamodule.database_dataloader
+      val_dataloader = self.trainer.datamodule.val_dataloader()
+
+      val_MAP, val_metrics_KNN, val_matrics_CHC = compute_metrics(database_dataloader, val_dataloader, self, TOP_K, self.n_class)
+      val_labeling_accuracy_KNN, val_F1_score_weighted_average_KNN,\
+       val_F1_score_per_class_median_KNN, val_F1_score_per_class_KNN = val_metrics_KNN
+      val_labeling_accuracy_CHC, val_F1_score_weighted_average_CHC,\
+       val_F1_score_per_class_median_CHC, val_F1_score_per_class_CHC = val_matrics_CHC
+
+      if not self.trainer.running_sanity_check:
+          print(f"Epoch: {self.current_epoch}, Val_loss_epoch: {val_loss_epoch:.2f}, Val_MAP_epoch: {val_MAP:.3f}")
+          print(f"val_labeling_accuracy_KNN:{val_labeling_accuracy_KNN:.3f}, val_F1_score_weighted_average_KNN:{val_F1_score_weighted_average_KNN:.3f},\
+           val_F1_score_per_class_median_KNN:{val_F1_score_per_class_median_KNN:.3f}, Val_F1_score_per_class_KNN:{[f'{score:.3f}' for score in val_F1_score_per_class_KNN]}")
+          print(f"val_labeling_accuracy_CHC:{val_labeling_accuracy_CHC:.3f}, val_F1_score_weighted_average_CHC:{val_F1_score_weighted_average_CHC:.3f},\
+           val_F1_score_per_class_median_CHC:{val_F1_score_per_class_median_CHC:.3f}, Val_F1_score_per_class_CHC:{[f'{score:.3f}' for score in val_F1_score_per_class_CHC]}")
+
+      value = {"Val_loss_epoch": val_loss_epoch, "Val_MAP_epoch": val_MAP, 
+               "Val_labeling_accuracy_KNN_epoch": val_labeling_accuracy_KNN, "Val_F1_score_weighted_average_KNN_epoch": val_F1_score_weighted_average_KNN,
+               "Val_F1_score_per_class_median_KNN_epoch": val_F1_score_per_class_median_KNN, 
+               "Val_labeling_accuracy_CHC_epoch": val_labeling_accuracy_CHC, "Val_F1_score_weighted_average_CHC_epoch": val_F1_score_weighted_average_CHC,
+               "Val_F1_score_per_class_median_CHC_epoch": val_F1_score_per_class_median_CHC}
+      self.log_dict(value, prog_bar=True, logger=True)
+
+
+
+  def test_step(self, test_batch, batch_idx):
+      data, labels = test_batch
+      hash_codes = self.forward(data)
+      loss = self.CSQ_loss_function(hash_codes, labels)
+
+      return loss
+
+  def test_epoch_end(self, outputs):
+      test_loss_epoch = torch.stack([x for x in outputs]).mean()
+
+      database_dataloader = self.trainer.datamodule.database_dataloader
+      test_dataloader = self.trainer.datamodule.test_dataloader()
+
+      test_MAP, test_metrics_KNN, test_matrics_CHC = compute_metrics(database_dataloader, test_dataloader, self, TOP_K, self.n_class)
+      test_labeling_accuracy_KNN, test_F1_score_weighted_average_KNN,\
+       test_F1_score_per_class_median_KNN, test_F1_score_per_class_KNN = test_metrics_KNN
+      test_labeling_accuracy_CHC, test_F1_score_weighted_average_CHC,\
+       test_F1_score_per_class_median_CHC, test_F1_score_per_class_CHC = test_matrics_CHC
+
+      if not self.trainer.running_sanity_check:
+          print(f"Epoch: {self.current_epoch}, Test_loss_epoch: {test_loss_epoch:.2f}, Test_MAP_epoch: {test_MAP:.3f}")
+          print(f"test_labeling_accuracy_KNN:{test_labeling_accuracy_KNN:.3f}, test_F1_score_weighted_average_KNN:{test_F1_score_weighted_average_KNN:.3f},\
+           test_F1_score_per_class_median_KNN:{test_F1_score_per_class_median_KNN:.3f}, test_F1_score_per_class_KNN:{[f'{score:.3f}' for score in test_F1_score_per_class_KNN]}")
+          print(f"test_labeling_accuracy_CHC:{test_labeling_accuracy_CHC:.3f}, test_F1_score_weighted_average_CHC:{test_F1_score_weighted_average_CHC:.3f},\
+           test_F1_score_per_class_median_CHC:{test_F1_score_per_class_median_CHC:.3f}, test_F1_score_per_class_CHC:{[f'{score:.3f}' for score in test_F1_score_per_class_CHC]}")
+
+      value = {"Test_loss_epoch": test_loss_epoch, "Test_MAP_epoch": test_MAP, 
+               "Test_labeling_accuracy_KNN_epoch": test_labeling_accuracy_KNN, "Test_F1_score_weighted_average_KNN_epoch": test_F1_score_weighted_average_KNN,
+               "Test_F1_score_per_class_median_KNN_epoch": test_F1_score_per_class_median_KNN, 
+               "Test_labeling_accuracy_CHC_epoch": test_labeling_accuracy_CHC, "Test_F1_score_weighted_average_CHC_epoch": test_F1_score_weighted_average_CHC,
+               "Test_F1_score_per_class_median_CHC_epoch": test_F1_score_per_class_median_CHC}
+      self.log_dict(value, prog_bar=True, logger=True)
+
+
+
+  def configure_optimizers(self):
+    # optimizer = torch.optim.RMSprop(self.parameters(),
+    #                                 lr=self.l_r, weight_decay=10**-4)
+    optimizer = torch.optim.Adam(self.parameters(), 
+                                 lr=self.l_r, weight_decay=10**-5)
+
+    # Decay LR by a factor of 0.9 every 10 epochs
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.5)
+    
+    return [optimizer], [exp_lr_scheduler]
+
+if __name__ == '__main__':
+    # train
+    pl.callbacks.progress.ProgressBar(refresh_rate=30)
+
+    # datamodule = TMDataModule(import_size=1, num_workers=4)
+    # N_CLASS = 55
+    # N_FEATURES = datamodule.N_FEATURES
+
+    datamodule = BaronHumanDataModule(num_workers=4, batch_size=128)
+    N_CLASS = 13
+    N_FEATURES = 17499
+
+    # datamodule = Zheng68KDataModule(num_workers=4)
+    # N_CLASS = 11
+    # N_FEATURES = 20387
+
+    # annotation_level可以是3，16或者92
+    # datamodule = AMBDataModule(num_workers=4, annotation_level=3)
+    # N_CLASS = 3
+    # N_FEATURES = 42625
+
+    model = CSQLightening(N_CLASS, N_FEATURES, l_r=1.2e-5, lamb_da=0.001, beta=0.9999)
+
+    # Init ModelCheckpoint callback
+    checkpoint_callback = ModelCheckpoint(monitor='Val_F1_score_per_class_median_CHC_epoch',
+                                        dirpath='/checkpoints',
+                                        filename='CSQ-{epoch:02d}-{Val_F1_average:.3f}',
+                                        verbose=True,
+                                        mode='max')
+
+    trainer = pl.Trainer(max_epochs=300, 
+                        gpus=1, 
+                        check_val_every_n_epoch=20,
+                        #  limit_train_batches=0.1,
+                        #  limit_val_batches=0.2,
+                        #  accelerator='ddp',
+                        #  plugins='ddp_sharded',
+                        checkpoint_callback=checkpoint_callback)
+
+    trainer.fit(model, datamodule)
