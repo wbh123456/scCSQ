@@ -23,6 +23,7 @@ from sklearn.metrics import f1_score
 # from ray.tune import CLIReporter
 import shutil
 import fairscale
+import argparse
 
 # Make tqdm module to print in a 1 line
 # from functools import partial
@@ -67,19 +68,20 @@ def test_class_balance_loss():
 TOP_K = 5
 
 class CSQLightening(pl.LightningModule):
-  def __init__(self,n_class,n_features,batch_size=64,l_r=1e-5,lamb_da=0.0001,beta=0.9999,bit=64):
+  def __init__(self,n_class,n_features,batch_size=64,l_r=1e-5,lamb_da=0.0001,beta=0.9999,bit=64,lr_decay=0.9,decay_every=20):
     super(CSQLightening, self).__init__()
-    print("hparam: l_r = {}, lambda = {}, beta = {}", l_r, lamb_da, beta)
+    print("hparam: l_r = {}, lambda = {}, beta = {}".format(l_r, lamb_da, beta))
     self.batch_size = batch_size
     self.l_r = l_r
     self.bit = bit
     self.n_class = n_class
     self.lamb_da = lamb_da
     self.beta = beta
+    self.lr_decay = lr_decay
+    self.decay_every = decay_every
     self.samples_in_each_class = None # Later initialized in training step
     self.hash_centers = get_hash_centers(self.n_class, self.bit)
     ##### model structure ####
-    # input size = batch size * 19791
     self.hash_layer = nn.Sequential(
         nn.Linear(n_features, 9000),
         nn.ReLU(inplace=True),
@@ -124,8 +126,8 @@ class CSQLightening(pl.LightningModule):
     weight = weight.type_as(hash_codes)
 
     # Center Similarity Loss
-    # BCELoss = nn.BCELoss(weight=weight.unsqueeze(1).repeat(1,self.bit))
-    BCELoss = nn.BCELoss()
+    BCELoss = nn.BCELoss(weight=weight.unsqueeze(1).repeat(1,self.bit))
+    # BCELoss = nn.BCELoss()
     C_loss = BCELoss(0.5 * (hash_codes + 1), 
                         0.5 * (hash_centers + 1))
     # Quantization Loss
@@ -141,7 +143,7 @@ class CSQLightening(pl.LightningModule):
 
       # 在这里，好像loss本身就会被记录并且显示在progress bar里，
       # 所以"Train_loss_step"我就不在progress bar里显示了，只在tensor board里面显示
-      self.log("Train_loss_step", loss, logger=True)
+      # self.log("Train_loss_step", loss, logger=False)
       return loss
 
 
@@ -179,7 +181,7 @@ class CSQLightening(pl.LightningModule):
       self.log_dict(value, prog_bar=True, logger=True)
 
 
-
+ 
   def test_step(self, test_batch, batch_idx):
       data, labels = test_batch
       hash_codes = self.forward(data)
@@ -221,51 +223,104 @@ class CSQLightening(pl.LightningModule):
     optimizer = torch.optim.Adam(self.parameters(), 
                                  lr=self.l_r, weight_decay=10**-5)
 
-    # Decay LR by a factor of 0.9 every 10 epochs
-    exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.5)
+    # Decay LR by a factor of gamma every step_size epochs
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=self.decay_every, gamma=self.lr_decay)
     
     return [optimizer], [exp_lr_scheduler]
 
 if __name__ == '__main__':
-    # train
-    pl.callbacks.progress.ProgressBar(refresh_rate=30)
+    pl.callbacks.progress.ProgressBar(refresh_rate=5)
 
-    datamodule = TMDataModule(import_size=1, num_workers=4)
-    N_CLASS = 55
-    N_FEATURES = datamodule.N_FEATURES
+    # Parse parameters
+    parser = argparse.ArgumentParser()
+    # Hyperparameters
+    parser.add_argument("--l_r", type=float, default=1.2e-5,
+                        help="learning rate")
+    parser.add_argument("--lamb", type=float, default=0.001,
+                        help="lambda of quantization loss")
+    parser.add_argument("--beta", type=float, default=0.9999,
+                        help="beta of class balance loss")
+    parser.add_argument("--lr_decay", type=float, default=0.5,
+                        help="learning rate decay")
+    parser.add_argument("--decay_every", type=int, default=25,
+                        help="how many epochs a learning rate happens")
+    # Training parameters
+    parser.add_argument("--epochs", type=int, default=301,
+                        help="number of epochs to run")
+    parser.add_argument("--dataset", choices=['TM', 'BaronHuman', 'Zheng68K', 'AMB', "XIN"],
+                        help="dataset to train against")
+    # Control parameters
+    parser.add_argument("--test", type=str, default='',
+                        help="To test against a specific checkpoint")                   
+    args = parser.parse_args()
 
-    # datamodule = BaronHumanDataModule(num_workers=4, batch_size=128)
-    # N_CLASS = 13
-    # N_FEATURES = 17499
+    l_r = args.l_r
+    lamb_da = args.lamb
+    beta = args.beta
+    max_epochs = args.epochs
+    dataset = args.dataset
+    lr_decay = args.lr_decay
+    decay_every = args.decay_every
+    test_checkpoint = args.test
 
-    # datamodule = Zheng68KDataModule(num_workers=4)
-    # N_CLASS = 11
-    # N_FEATURES = 20387
+    print(args)
 
-    # annotation_level可以是3，16或者92
-    # datamodule = AMBDataModule(num_workers=4, annotation_level=3)
-    # N_CLASS = 3
-    # N_FEATURES = 42625
-
-    model = CSQLightening(N_CLASS, N_FEATURES, l_r=1.2e-5, lamb_da=0.001, beta=0.9999)
+    # set up datamodule
+    if dataset == "TM":
+      datamodule = TMDataModule(import_size=1, num_workers=4)
+      N_CLASS = 55
+      N_FEATURES = datamodule.N_FEATURES
+    elif dataset == "BaronHuman":
+      datamodule = BaronHumanDataModule(num_workers=4, batch_size=128)
+      N_CLASS = 13
+      N_FEATURES = 17499
+    elif dataset == "Zheng68K":
+      datamodule = Zheng68KDataModule(num_workers=4)
+      N_CLASS = 11
+      N_FEATURES = 20387
+    elif dataset == "AMB":  
+      # annotation_level可以是3，16或者92
+      datamodule = AMBDataModule(num_workers=4, annotation_level=3)
+      N_CLASS = 3
+      N_FEATURES = 42625
+    elif dataset == "XIN":
+      datamodule = XinDataModule(num_workers=4, batch_size=128)
+      N_CLASS = 4
+      N_FEATURES = 33889
+    else:
+      print("Unknown dataset:", dataset)
+      exit()
 
     # Init ModelCheckpoint callback
-    checkpoint_callback = ModelCheckpoint(monitor='Val_F1_score_per_class_median_CHC_epoch',
-                                        dirpath='/checkpoints',
-                                        filename='CSQ-{epoch:02d}-{Val_F1_average:.3f}',
+    checkpointPath = "checkpoints/" + dataset
+    checkpoint_callback = ModelCheckpoint(monitor='Val_F1_score_median_CHC_epoch',
+                                        dirpath=checkpointPath,
+                                        filename='CSQ-{epoch:02d}-{Val_F1_score_median_CHC_epoch:.3f}',
                                         verbose=True,
                                         mode='max')
 
-    trainer = pl.Trainer(max_epochs=200, 
-                        gpus=1, 
-                        check_val_every_n_epoch=20,
-                        #  limit_train_batches=0.1,
-                        #  limit_val_batches=0.2,
-                        #  accelerator='ddp',
-                        #  plugins='ddp_sharded',
-                        # checkpoint_callback=checkpoint_callback
-                        )
+    trainer = pl.Trainer(max_epochs=max_epochs, 
+                    gpus=1, 
+                    check_val_every_n_epoch=20,
+                    #  limit_train_batches=0.2,
+                    #  limit_val_batches=0.2,
+                    #  accelerator='ddp',
+                    #  plugins='ddp_sharded',
+                    checkpoint_callback=checkpoint_callback
+                    )
 
-    trainer.fit(model, datamodule)
+    # To test against a specific checkpoint
+    if test_checkpoint != '':
+      model = CSQLightening.load_from_checkpoint(test_checkpoint,n_class=N_CLASS,n_features=N_FEATURES)
+      model.eval()
 
-    trainer.test(model)
+      trainer.test(model, datamodule=datamodule)
+
+    # Train
+    else:
+      model = CSQLightening(N_CLASS, N_FEATURES, l_r=l_r, lamb_da=lamb_da, beta=beta, lr_decay=lr_decay,decay_every=decay_every)
+
+      trainer.fit(model, datamodule)
+      trainer.test(model)
+          
+
