@@ -5,6 +5,7 @@ lightning_logs/
 # virtual environment
 .venv/
 
+*.ckpt
 *.log
 lightning_logs
 
