@@ -4,26 +4,17 @@ import torch
 from torchvision import models
 from torch import nn
 import pytorch_lightning as pl
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, random_split, Subset, Dataset
 from torch.nn import functional as F
-from torchvision import datasets, transforms
-import torch.optim as optim
 import os
 from tqdm import tqdm
-from pytorch_lightning.callbacks import ModelCheckpoint
 from collections import Counter
 import statistics
-from torchvision.datasets.utils import download_and_extract_archive
 import pandas as pd
 import numpy as np
-from sklearn import preprocessing
 from sklearn.metrics import f1_score
-# from ray.tune.integration.pytorch_lightning import TuneReportCallback
-# from ray import tune
-# from ray.tune import CLIReporter
 import shutil
 import fairscale
+import time
 
 # use algorithm 1 to generate hash centers
 def get_hash_centers(n_class, bit):
@@ -62,7 +53,7 @@ def get_hash_centers(n_class, bit):
 
 
 # 计算所有metrics的top-level interface
-def compute_metrics(query_dataloader, net, class_num):
+def compute_metrics(query_dataloader, net, class_num, show_time=False):
       ''' Labeling Strategy:
       Closest Hash Center:
       Label the query using the label associated to the nearest hash center
@@ -75,8 +66,13 @@ def compute_metrics(query_dataloader, net, class_num):
       binaries_query, labels_query = compute_result(query_dataloader, net)
 
       # 根据自定义的labeling策略，得到预测的labels
+      start_time_CHC = time.time()
       labels_pred_CHC = get_labels_pred_closest_hash_center(binaries_query.cpu().numpy(), labels_query.numpy(),
                                                             net.hash_centers.numpy())
+      CHC_duration = time.time() - start_time_CHC
+      query_num = binaries_query.shape[0]
+      if show_time:
+        print("  CHC query speed: {:.2f} queries/s".format(query_num/CHC_duration))
       
       # (1) 自定义的labeling策略的accuracy
       labeling_accuracy_CHC = compute_labeling_strategy_accuracy(labels_pred_CHC, labels_query.numpy())

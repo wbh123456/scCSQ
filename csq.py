@@ -177,15 +177,15 @@ class CSQLightening(pl.LightningModule):
         val_labeling_accuracy_CHC, val_F1_score_weighted_average_CHC, val_F1_score_median_CHC, val_F1_score_per_class_CHC = val_matrics_CHC
 
         if not self.trainer.running_sanity_check:
-            print(
-                f"Epoch: {self.current_epoch}, Val_loss_epoch: {val_loss_epoch:.2f}")
+            print(f"Epoch: {self.current_epoch}, Val_loss_epoch: {val_loss_epoch:.2f}")
+            print(f"val_F1_score_median_CHC:{val_F1_score_median_CHC:.3f}, val_labeling_accuracy_CHC:{val_labeling_accuracy_CHC:.3f},\
+                   val_F1_score_weighted_average_CHC:{val_F1_score_weighted_average_CHC:.3f},\
+                   val_F1_score_per_class_CHC:{[f'{score:.3f}' for score in val_F1_score_per_class_CHC]}")
 
-            print(f"val_labeling_accuracy_CHC:{val_labeling_accuracy_CHC:.3f}, val_F1_score_weighted_average_CHC:{val_F1_score_weighted_average_CHC:.3f},\
-           val_F1_score_median_CHC:{val_F1_score_median_CHC:.3f}, val_F1_score_per_class_CHC:{[f'{score:.3f}' for score in val_F1_score_per_class_CHC]}")
-
-        value = {"Val_loss_epoch": val_loss_epoch,
-                 "Val_labeling_accuracy_CHC_epoch": val_labeling_accuracy_CHC, "Val_F1_score_weighted_average_CHC_epoch": val_F1_score_weighted_average_CHC,
-                 "Val_F1_score_median_CHC_epoch": val_F1_score_median_CHC}
+        value = {"Val_loss_epoch": val_loss_epoch, 
+                  "Val_F1_score_median_CHC_epoch": val_F1_score_median_CHC,
+                  "Val_labeling_accuracy_CHC_epoch": val_labeling_accuracy_CHC, 
+                  "Val_F1_score_weighted_average_CHC_epoch": val_F1_score_weighted_average_CHC, }
         self.log_dict(value, prog_bar=True, logger=True)
 
     def test_step(self, test_batch, batch_idx):
@@ -201,18 +201,19 @@ class CSQLightening(pl.LightningModule):
         database_dataloader = self.trainer.datamodule.database_dataloader
         test_dataloader = self.trainer.datamodule.test_dataloader()
 
-        test_matrics_CHC = compute_metrics(test_dataloader, self, self.n_class)
+        test_matrics_CHC = compute_metrics(test_dataloader, self, self.n_class, show_time=True)
         test_labeling_accuracy_CHC, test_F1_score_weighted_average_CHC, test_F1_score_median_CHC, test_F1_score_per_class_CHC = test_matrics_CHC
 
         if not self.trainer.running_sanity_check:
-            print(
-                f"Epoch: {self.current_epoch}, Test_loss_epoch: {test_loss_epoch:.2f}")
-            print(f"test_labeling_accuracy_CHC:{test_labeling_accuracy_CHC:.3f}, test_F1_score_weighted_average_CHC:{test_F1_score_weighted_average_CHC:.3f},\
-           test_F1_score_median_CHC:{test_F1_score_median_CHC:.3f}, test_F1_score_per_class_CHC:{[f'{score:.3f}' for score in test_F1_score_per_class_CHC]}")
+            print(f"Epoch: {self.current_epoch}, Test_loss_epoch: {test_loss_epoch:.2f}")
+            print(f"test_F1_score_median_CHC:{test_F1_score_median_CHC:.3f}, test_labeling_accuracy_CHC:{test_labeling_accuracy_CHC:.3f}, \
+                    test_F1_score_weighted_average_CHC:{test_F1_score_weighted_average_CHC:.3f}, \
+                    test_F1_score_per_class_CHC:{[f'{score:.3f}' for score in test_F1_score_per_class_CHC]}")
 
         value = {"Test_loss_epoch": test_loss_epoch,
-                 "Test_labeling_accuracy_CHC_epoch": test_labeling_accuracy_CHC, "Test_F1_score_weighted_average_CHC_epoch": test_F1_score_weighted_average_CHC,
-                 "Test_F1_score_median_CHC_epoch": test_F1_score_median_CHC}
+                 "Test_F1_score_median_CHC_epoch": test_F1_score_median_CHC,
+                 "Test_labeling_accuracy_CHC_epoch": test_labeling_accuracy_CHC, 
+                 "Test_F1_score_weighted_average_CHC_epoch": test_F1_score_weighted_average_CHC}
         self.log_dict(value, prog_bar=True, logger=True)
 
     def configure_optimizers(self):
@@ -229,7 +230,7 @@ class CSQLightening(pl.LightningModule):
 
 
 if __name__ == '__main__':
-    pl.callbacks.progress.ProgressBar(refresh_rate=5)
+    pl.callbacks.progress.ProgressBar(refresh_rate=1)
 
     # Parse parameters
     parser = argparse.ArgumentParser()

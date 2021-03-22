@@ -7,10 +7,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, random_split, Subset, Dataset
 from torch.nn import functional as F
 from torchvision import datasets, transforms
-import torch.optim as optim
 import os
-from tqdm import tqdm
-from pytorch_lightning.callbacks import ModelCheckpoint
 from collections import Counter
 import statistics
 
