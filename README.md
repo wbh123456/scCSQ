@@ -1,5 +1,5 @@
-# sc-csq
-sc csq
+# Single-cell Deep Hashing (scDeepHash)
+A deep-learning-based single-cell classification model with central similarity hashing method.
 
 ## To Run:
 ### Establish a venv
