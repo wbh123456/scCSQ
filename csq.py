@@ -93,7 +93,7 @@ class CSQLightening(pl.LightningModule):
         self.lr_decay = lr_decay
         self.decay_every = decay_every
         self.samples_in_each_class = None  # Later initialized in training step
-        self.hash_centers = get_hash_centers(self.n_class, self.bit)
+        # self.hash_centers = get_hash_centers(self.n_class, self.bit)
         ##### model structure ####
         self.hash_layer = nn.Sequential(
             nn.Linear(n_features, 9000),
@@ -112,10 +112,26 @@ class CSQLightening(pl.LightningModule):
             nn.Linear(200, self.bit),
         )
 
+        self.center_layer = nn.Sequential(
+            nn.Linear(1,10),
+            nn.ReLU(inplace=True),
+            nn.Linear(10,100),
+            nn.ReLU(inplace=True),
+            nn.Linear(100,n_class*self.bit),
+        )
+
     def forward(self, x):
         # forward pass returns prediction
         x = self.hash_layer(x)
         return x
+
+    def forward_hash_center(self):
+        # Fixed input 1. Hardcoded the input on GPU
+        one_input = torch.from_numpy(np.array([1])).cuda().float()
+        learned_hash_centers = self.center_layer(one_input)
+        # Reshape the output to (# of classes) x (# of bits)
+        learned_hash_centers = torch.reshape(learned_hash_centers, (self.n_class, self.bit))
+        return learned_hash_centers
 
     def get_class_balance_loss_weight(samples_in_each_class, n_class, beta=0.9999):
         # Class-Balanced Loss on Effective Number of Samples
@@ -124,10 +140,42 @@ class CSQLightening(pl.LightningModule):
         weight = weight / weight.sum() * n_class
         return weight
 
-    def CSQ_loss_function(self, hash_codes, labels):
+    def get_closest_false_hash_center(self, centers, labels, hash_codes):
+        '''
+        centers: learned hashing center: C * K
+        labels: N
+        hash_codes: N * K
+        '''
+        # Get distances to the closest hash center that is not the label of the input
+        distances = euclidean_distance(hash_codes, centers)
+        # print("dis = ", distances)
+        mask = make_one_hot(labels, self.n_class)
+        mask = mask.cuda()
+
+        valmax = distances.max()
+
+        # Add valmax to distances of correct hashing centers
+        # Trick to not select the correct hashing center in min() operation
+        distances_incor = distances + mask * valmax
+        distances_cor = distances + (1-mask) * valmax
+
+        dist_cor, _ = distances_cor.min(-1)
+        min_dist_incor, _ = distances_incor.min(-1)
+
+        loss = F.relu(dist_cor - min_dist_incor + 32)
+        loss = loss.mean()
+        # print("LOSS=", loss)
+        return loss
+
+    def CSQ_loss_function(self, hash_codes, learned_hash_centers, labels):
         hash_codes = hash_codes.tanh()
-        hash_centers = self.hash_centers[labels]
-        hash_centers = hash_centers.type_as(hash_codes)
+        if learned_hash_centers != None:
+            # Learning hashing centers
+            hash_centers = learned_hash_centers[labels]
+        else:
+            # Using fixed hashing centers
+            hash_centers = self.hash_centers[labels]
+            hash_centers = hash_centers.type_as(hash_codes)
 
         if self.samples_in_each_class == None:
             self.samples_in_each_class = self.trainer.datamodule.samples_in_each_class
@@ -142,28 +190,29 @@ class CSQLightening(pl.LightningModule):
         BCELoss = nn.BCELoss(weight=weight.unsqueeze(1).repeat(1, self.bit))
         # BCELoss = nn.BCELoss()
         C_loss = BCELoss(0.5 * (hash_codes + 1),
-                         0.5 * (hash_centers + 1))
+                         0.5 * (hash_centers.detach() + 1)) # Detach hash centers to avoid bug, so we don't train hash centers here
+
+        # Center Loss
+        center_loss = self.get_closest_false_hash_center(learned_hash_centers, labels, hash_codes)
+        
         # Quantization Loss
         Q_loss = (hash_codes.abs() - 1).pow(2).mean()
 
-        loss = C_loss + self.lamb_da * Q_loss
+        loss = C_loss + self.lamb_da * Q_loss + 0.9*center_loss
         return loss
 
     def training_step(self, train_batch, batch_idx):
         data, labels = train_batch
         hash_codes = self.forward(data)
-        loss = self.CSQ_loss_function(hash_codes, labels)
-
-        # 在这里，好像loss本身就会被记录并且显示在progress bar里，
-        # 所以"Train_loss_step"我就不在progress bar里显示了，只在tensor board里面显示
-        # self.log("Train_loss_step", loss, logger=False)
+        learned_hash_centers = self.forward_hash_center()
+        loss = self.CSQ_loss_function(hash_codes, learned_hash_centers, labels)
         return loss
 
     def validation_step(self, val_batch, batch_idx):
         data, labels = val_batch
         hash_codes = self.forward(data)
-        loss = self.CSQ_loss_function(hash_codes, labels)
-
+        learned_hash_centers = self.forward_hash_center()
+        loss = self.CSQ_loss_function(hash_codes, learned_hash_centers, labels)
         return loss
 
     def validation_epoch_end(self, outputs):
@@ -191,8 +240,8 @@ class CSQLightening(pl.LightningModule):
     def test_step(self, test_batch, batch_idx):
         data, labels = test_batch
         hash_codes = self.forward(data)
-        loss = self.CSQ_loss_function(hash_codes, labels)
-
+        learned_hash_centers = self.forward_hash_center()
+        loss = self.CSQ_loss_function(hash_codes, learned_hash_centers, labels)
         return loss
 
     def test_epoch_end(self, outputs):
@@ -251,7 +300,7 @@ if __name__ == '__main__':
     parser.add_argument("--lr_decay", type=float, default=0.5,
                         help="learning rate decay")
     parser.add_argument("--decay_every", type=int, default=25,
-                        help="how many epochs a learning rate happens")
+                        help="how many epochs a learning rate happens brefore it decays")
     # Training parameters
     parser.add_argument("--epochs", type=int, default=301,
                         help="number of epochs to run")
@@ -330,7 +379,7 @@ if __name__ == '__main__':
                             #  limit_val_batches=0.2,
                             #  accelerator='ddp',
                             #  plugins='ddp_sharded',
-                            checkpoint_callback=checkpoint_callback
+                            # checkpoint_callback=checkpoint_callback
                             )
         model = CSQLightening(N_CLASS, N_FEATURES, l_r=l_r, lamb_da=lamb_da,
                               beta=beta, lr_decay=lr_decay, decay_every=decay_every)

@@ -48,10 +48,6 @@ def get_hash_centers(n_class, bit):
                 break
     return hash_targets
 
-# Needs to add algorithm 2 to generate hash centers
-
-
-
 # 计算所有metrics的top-level interface
 def compute_metrics(query_dataloader, net, class_num, show_time=False, use_cpu=False):
       ''' Labeling Strategy:
@@ -69,8 +65,9 @@ def compute_metrics(query_dataloader, net, class_num, show_time=False, use_cpu=F
         binaries_query, labels_query = compute_result(query_dataloader, net)
 
       # 根据自定义的labeling策略，得到预测的labels
+      hash_centers = net.forward_hash_center().sign()
       labels_pred_CHC = get_labels_pred_closest_hash_center(binaries_query.cpu().numpy(), labels_query.numpy(),
-                                                            net.hash_centers.numpy())
+                                                            hash_centers.cpu().numpy())
       CHC_duration = time.time() - start_time_CHC
       query_num = binaries_query.shape[0]
       if show_time:
@@ -89,6 +86,34 @@ def compute_metrics(query_dataloader, net, class_num, show_time=False, use_cpu=F
       CHC_metrics = (labeling_accuracy_CHC, F1_score_weighted_average_CHC, F1_score_median_CHC, F1_score_per_class_CHC)
 
       return CHC_metrics
+
+def euclidean_distance(x, y):
+    '''
+    Compute euclidean distance between two tensors
+    '''
+    # x (tensor): N x D
+    # y (tensor): M x D
+    # Return: N x M
+    n = x.size(0)
+    m = y.size(0)
+    d = x.size(1)
+    if d != y.size(1):
+        raise Exception("size mismatch")
+
+    x = x.unsqueeze(1).expand(n, m, d)
+    y = y.unsqueeze(0).expand(n, m, d)
+    # l = torch.nn.BCELoss()
+    # return l(x, y)
+    return torch.pow(x - y, 2).sum(2)
+
+def make_one_hot(labels, n_classes):
+    """
+    :param labels: the labels in int form
+    :param n_classes: the number of classes
+    :return: a one hot vector with these class labels
+    """
+    one_hot = torch.zeros((labels.shape[-1], n_classes))
+    return one_hot.scatter_(1, torch.unsqueeze(labels, 1).long().cpu(), 1).byte()
 
 def test_speed(dataloader, net, size=280):
     # get 200 data samples and evaluate them
@@ -109,7 +134,8 @@ def test_speed(dataloader, net, size=280):
     for i in range(rep_num):
         start_time_CHC = time.time()
         binary_codes = (net(data_200.cpu())).data
-        labels_pred_CHC = get_labels_pred_closest_hash_center(binary_codes.cpu().numpy(), labels.numpy(), net.hash_centers.numpy())
+        hash_centers = net.forward_hash_center().cpu().data
+        labels_pred_CHC = get_labels_pred_closest_hash_center(binary_codes.cpu().numpy(), labels.numpy(), hash_centers.numpy())
         CHC_duration = time.time() - start_time_CHC
         times.append(CHC_duration)
     times = np.array(times)
