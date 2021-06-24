@@ -113,11 +113,13 @@ class CSQLightening(pl.LightningModule):
         )
 
         self.center_layer = nn.Sequential(
-            nn.Linear(1,10),
+            nn.Linear(1,8),
             nn.ReLU(inplace=True),
-            nn.Linear(10,100),
+            nn.Linear(8,64),
             nn.ReLU(inplace=True),
-            nn.Linear(100,n_class*self.bit),
+            nn.Linear(64,512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512,n_class*self.bit),
         )
 
     def forward(self, x):
@@ -128,6 +130,7 @@ class CSQLightening(pl.LightningModule):
     def forward_hash_center(self):
         # Fixed input 1. Hardcoded the input on GPU
         one_input = torch.from_numpy(np.array([1])).cuda().float()
+        # one_input = torch.from_numpy(np.array([1])).cpu().float()
         learned_hash_centers = self.center_layer(one_input)
         # Reshape the output to (# of classes) x (# of bits)
         learned_hash_centers = torch.reshape(learned_hash_centers, (self.n_class, self.bit))
@@ -157,7 +160,11 @@ class CSQLightening(pl.LightningModule):
         # Add valmax to distances of correct hashing centers
         # Trick to not select the correct hashing center in min() operation
         distances_incor = distances + mask * valmax
-        distances_cor = distances + (1-mask) * valmax
+        distances_cor = distances + (1-mask) * valmax 
+         
+        # print("distance type =", distances.dtype) 
+        # print("mask type =", mask.dtype) 
+        # print("valmax type =", valmax.dtype)
 
         dist_cor, _ = distances_cor.min(-1)
         min_dist_incor, _ = distances_incor.min(-1)
@@ -165,7 +172,7 @@ class CSQLightening(pl.LightningModule):
         loss = F.relu(dist_cor - min_dist_incor + 32)
         loss = loss.mean()
         # print("LOSS=", loss)
-        return loss
+        return loss.float()
 
     def CSQ_loss_function(self, hash_codes, learned_hash_centers, labels):
         hash_codes = hash_codes.tanh()
@@ -196,9 +203,17 @@ class CSQLightening(pl.LightningModule):
         center_loss = self.get_closest_false_hash_center(learned_hash_centers, labels, hash_codes)
         
         # Quantization Loss
-        Q_loss = (hash_codes.abs() - 1).pow(2).mean()
+        Q_loss = (hash_codes.abs() - 1).pow(2).mean() 
+         
+        Q_loss_center = (learned_hash_centers.abs() - 1).pow(2).mean()
+        
+        loss = C_loss + self.lamb_da * Q_loss + 0.9 * center_loss
+        # loss = C_loss + self.lamb_da * Q_loss + 0.9 * center_loss + 0.01 * Q_loss_center
+         
+        # print("C_loss type =", C_loss.dtype) 
+        # print("Q_loss type =", Q_loss.dtype) 
+        # print("center_loss type =", center_loss.dtype)
 
-        loss = C_loss + self.lamb_da * Q_loss + 0.9*center_loss
         return loss
 
     def training_step(self, train_batch, batch_idx):
@@ -212,7 +227,7 @@ class CSQLightening(pl.LightningModule):
         data, labels = val_batch
         hash_codes = self.forward(data)
         learned_hash_centers = self.forward_hash_center()
-        loss = self.CSQ_loss_function(hash_codes, learned_hash_centers, labels)
+        loss = self.CSQ_loss_function(hash_codes, learned_hash_centers, labels)  
         return loss
 
     def validation_epoch_end(self, outputs):
@@ -235,7 +250,19 @@ class CSQLightening(pl.LightningModule):
                   "Val_F1_score_median_CHC_epoch": val_F1_score_median_CHC,
                   "Val_labeling_accuracy_CHC_epoch": val_labeling_accuracy_CHC, 
                   "Val_F1_score_weighted_average_CHC_epoch": val_F1_score_weighted_average_CHC, }
-        self.log_dict(value, prog_bar=True, logger=True)
+        self.log_dict(value, prog_bar=True, logger=True) 
+         
+        learned_hash_centers = self.forward_hash_center()
+        centers_continous = learned_hash_centers.detach().tanh()
+        centers = (centers_continous.sign() + 1)*0.5
+        print("---------------")
+        print("center quantization loss =", (abs(centers_continous)-1).pow(2).mean())
+
+        d = euclidean_distance(centers, centers).cpu().numpy()
+        print("Distances: ")
+        print(d)
+        print("Average Distance =", d.mean()) 
+        print("---------------")
 
     def test_step(self, test_batch, batch_idx):
         data, labels = test_batch
@@ -250,15 +277,17 @@ class CSQLightening(pl.LightningModule):
         database_dataloader = self.trainer.datamodule.database_dataloader
         test_dataloader = self.trainer.datamodule.test_dataloader()
 
-        test_matrics_CHC = compute_metrics(test_dataloader, self, self.n_class, show_time=True, use_cpu=True)
+        # TODO: Fix tensor runtime bug when using cpu to compute matrics
+        # test_matrics_CHC = compute_metrics(test_dataloader, self, self.n_class, show_time=True, use_cpu=True)
+        test_matrics_CHC = compute_metrics(test_dataloader, self, self.n_class, show_time=True, use_cpu=False)
         test_labeling_accuracy_CHC, test_F1_score_weighted_average_CHC, test_F1_score_median_CHC, test_F1_score_per_class_CHC = test_matrics_CHC
         
         # Test speed
-        test_speed(test_dataloader, self, 200)
-        test_speed(test_dataloader, self, 500)
-        test_speed(test_dataloader, self, 1000)
-        test_speed(test_dataloader, self, 5000)
-        test_speed(test_dataloader, self, 10000)
+        # test_speed(test_dataloader, self, 200)
+        # test_speed(test_dataloader, self, 500)
+        # test_speed(test_dataloader, self, 1000)
+        # test_speed(test_dataloader, self, 5000)
+        # test_speed(test_dataloader, self, 10000)
 
         if not self.trainer.running_sanity_check:
             print(f"Epoch: {self.current_epoch}, Test_loss_epoch: {test_loss_epoch:.2f}")
@@ -287,6 +316,8 @@ class CSQLightening(pl.LightningModule):
 
 if __name__ == '__main__':
     pl.callbacks.progress.ProgressBar(refresh_rate=1)
+
+    print("cuda version", torch.version.cuda)
 
     # Parse parameters
     parser = argparse.ArgumentParser()
@@ -349,7 +380,8 @@ if __name__ == '__main__':
         exit()
 
     # Init ModelCheckpoint callback
-    checkpointPath = "checkpoints/" + dataset
+    # checkpointPath = "checkpoints/" + dataset 
+    checkpointPath = "/scratch/gobi1/rexma/scCSQ/checkpoints/" + dataset
     checkpoint_callback = ModelCheckpoint(monitor='Val_F1_score_median_CHC_epoch',
                                           dirpath=checkpointPath,
                                           filename='CSQ-{epoch:02d}-{Val_F1_score_median_CHC_epoch:.3f}',
@@ -360,7 +392,7 @@ if __name__ == '__main__':
     # To test against a specific checkpoint
     if test_checkpoint != '':
         trainer = pl.Trainer(max_epochs=max_epochs,
-                        gpus=0,
+                        gpus=1,
                         check_val_every_n_epoch=5,
                         checkpoint_callback=checkpoint_callback
                         )
@@ -374,15 +406,17 @@ if __name__ == '__main__':
     else:
         trainer = pl.Trainer(max_epochs=max_epochs,
                             gpus=1,
-                            check_val_every_n_epoch=5,
+                            check_val_every_n_epoch=10,
                             #  limit_train_batches=0.2,
                             #  limit_val_batches=0.2,
                             #  accelerator='ddp',
                             #  plugins='ddp_sharded',
-                            # checkpoint_callback=checkpoint_callback
+                            # checkpoint_callback=checkpoint_callback 
+                            callbacks=[checkpoint_callback]
                             )
         model = CSQLightening(N_CLASS, N_FEATURES, l_r=l_r, lamb_da=lamb_da,
                               beta=beta, lr_decay=lr_decay, decay_every=decay_every)
 
+        # model.cuda()
         trainer.fit(model, datamodule)
         trainer.test(model)

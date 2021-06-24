@@ -102,8 +102,11 @@ def euclidean_distance(x, y):
 
     x = x.unsqueeze(1).expand(n, m, d)
     y = y.unsqueeze(0).expand(n, m, d)
-    # l = torch.nn.BCELoss()
-    # return l(x, y)
+
+    # l = torch.nn.BCELoss(reduction="none")
+    # loss = l(x.float(), y.float())
+
+    # return loss.mean(2)
     return torch.pow(x - y, 2).sum(2)
 
 def make_one_hot(labels, n_classes):
@@ -113,7 +116,7 @@ def make_one_hot(labels, n_classes):
     :return: a one hot vector with these class labels
     """
     one_hot = torch.zeros((labels.shape[-1], n_classes))
-    return one_hot.scatter_(1, torch.unsqueeze(labels, 1).long().cpu(), 1).byte()
+    return one_hot.scatter_(1, torch.unsqueeze(labels, 1).long().cpu(), 1).float()
 
 def test_speed(dataloader, net, size=280):
     # get 200 data samples and evaluate them
