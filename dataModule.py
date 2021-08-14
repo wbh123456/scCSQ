@@ -16,13 +16,12 @@ import pandas as pd
 import numpy as np
 from sklearn import preprocessing
 
+import rpy2.robjects as robjects
+from rpy2.robjects import pandas2ri
+from rpy2.robjects.conversion import localconverter
+
 ###------------------------------Utility function for DataLoader---------------------------------###
 # Used to discard labels with occurence smaller than 10
-
-TRAIN_SPLIT = 0.6
-VAL_SPLIT = 0.199
-TEST_SPLIT = 0.2
-
 def preprocess_data(full_labels, import_size=None):
 
     # Step #1: Convert from string into integer labels
@@ -94,6 +93,16 @@ def split_test_train_val_database_sets(full_dataset, train_percentage, val_perce
                                               Subset(full_dataset, test_indices))
     return TM_database, TM_train, TM_val, TM_test
 
+# Split a full datasets in a stratified way into train, validation sets
+def split_train_val_database_sets(full_dataset, train_idx, train_percentage):
+    full_labels = full_dataset.labels
+    full_indices = range(len(full_labels))
+
+    train_indices, val_indices = stratified_split(train_idx, full_labels, train_percentage)
+    train_set, val_set  = (Subset(full_dataset, train_indices), Subset(full_dataset, val_indices))
+    
+    return train_set, val_set
+
 
 class CustomDataset(Dataset):
     'A dataset base class for PyTorch Lightening'
@@ -124,8 +133,7 @@ class TMDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.data_name = "TM"
-        # Percentage of original dataset, Total dataset size = 54865. Went to 0.4 without crashing
-        self.import_size = import_size
+        self.import_size = import_size # Percentage of original dataset, Total dataset size = 54865. Went to 0.4 without crashing
         self.label_mapping = None
         self.N_FEATURES = 19791
         self.N_CLASS = 55
@@ -133,10 +141,9 @@ class TMDataModule(pl.LightningDataModule):
     def prepare_data(self):
         # download
         if not os.path.exists(f"{self.data_dir}/{self.data_name}"):
-            print("Start downloading TM!")
-            url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/TM.zip'
-            download_and_extract_archive(
-                url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
+          print("Start downloading TM!")
+          url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/TM.zip'
+          download_and_extract_archive(url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
 
     def setup(self, stage):
         # Assign train/val datasets for use in dataloaders
@@ -144,63 +151,57 @@ class TMDataModule(pl.LightningDataModule):
         DataPath = self.data_dir + "/" + self.data_name + "/Filtered_TM_data.csv"
         LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
 
-        # Step #1: Read in all labels
-        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
-        full_labels = np.asarray(labels)
-        labels = None
+        rf = robjects.r['load'](self.data_dir + "/" + self.data_name + "/CV_folds.RData")
 
-        # Step #2: Preprocess data and only keep cells with population larger than 10
-        remaining_labels, discarded_indices = preprocess_data(
-            full_labels, self.import_size)
+        with localconverter(robjects.default_converter + pandas2ri.converter):
+          test_idx = robjects.conversion.rpy2py(robjects.r['Test_Idx'])
+          train_idx = robjects.conversion.rpy2py(robjects.r['Train_Idx'])
+          cells_to_keep = robjects.conversion.rpy2py(robjects.r['Cells_to_Keep'])
 
-        # Step #3: Turning string class labels into int labels and store the mapping
+        # Step #1: Read in all labels and keep cells with count > 10
+        cells_to_keep = np.array(cells_to_keep, dtype=bool)
+        full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(full_labels)
+
+        remaining_labels = full_labels[cells_to_keep].ravel()
+
+        # Step #2: Turning string class labels into int labels and store the mapping
         self.label_mapping = preprocessing.LabelEncoder()
         self.label_mapping.fit(remaining_labels)
-        int_labels = self.label_mapping.transform(remaining_labels)
 
+        int_labels = self.label_mapping.transform(remaining_labels)
         full_labels = np.asarray(int_labels)
+
         remaining_labels = None
         int_labels = None
 
-        # Step #4: Read in data based on selected label indices
-        discarded_indices = [x + 1 for x in discarded_indices]
-        data = pd.read_csv(DataPath, index_col=0, sep=',',
-                           skiprows=discarded_indices)
-        discarded_indices = None
+        # Step #3: Read in data based on selected label indices
+        data = pd.read_csv(DataPath, index_col=0, sep=',')
         full_data = np.asarray(data, dtype=np.float32)
-        full_dataset = CustomDataset(full_data, full_labels)
+        full_data = full_data[cells_to_keep]
 
-        # Step #5: Split indices in stratified way into train, validation, test and database sets
-        #          and prepare all datasets based on splited list indices
-        self.TM_database, self.TM_train, self.TM_val, self.TM_test = split_test_train_val_database_sets(full_dataset,
-                                                                                                        train_percentage=TRAIN_SPLIT,
-                                                                                                        val_percentage=VAL_SPLIT,
-                                                                                                        test_percentage=TEST_SPLIT)
+        full_dataset = CustomDataset(data=full_data, labels=full_labels)
+        test_idx = np.array(test_idx[0]) - 1
+        train_idx = np.array(train_idx[0]) - 1
 
-        self.database_dataloader = None # Deprecated
-
+        self.TM_test = Subset(full_dataset, test_idx)
+        self.TM_train, self.TM_val = split_train_val_database_sets(full_dataset, train_idx, train_percentage=0.75)
         print("train size =", len(self.TM_train))
         print("val size =", len(self.TM_val))
         print("test size =", len(self.TM_test))
 
         # Calculate sample count in each class for training dataset
-        samples_in_each_class_dict = Counter(
-            [data[1] for data in self.TM_train])
-        print("training samples in each class =",
-              sorted(samples_in_each_class_dict.items()))
-        samples_in_each_class_dict_val = Counter(
-            [data[1] for data in self.TM_val])
-        print("val samples in each class =", sorted(
-            samples_in_each_class_dict_val.items()))
-        samples_in_each_class_dict_test = Counter(
-            [data[1] for data in self.TM_test])
-        print("test samples in each class =", sorted(
-            samples_in_each_class_dict_test.items()))
+        samples_in_each_class_dict = Counter([data[1] for data in self.TM_train])
+        print("training samples in each class =", samples_in_each_class_dict)
+        samples_in_each_class_dict_val = Counter([data[1] for data in self.TM_val])
+        print("val samples in each class =", samples_in_each_class_dict_val)
+        samples_in_each_class_dict_test = Counter([data[1] for data in self.TM_test])
+        print("test samples in each class =", samples_in_each_class_dict_test)
         self.N_CLASS = len(samples_in_each_class_dict)
         print("Changing N_CLASS =", self.N_CLASS)
         self.samples_in_each_class = torch.zeros(self.N_CLASS)
         for index, count in samples_in_each_class_dict.items():
-            self.samples_in_each_class[index] = count
+           self.samples_in_each_class[index] = count
 
     def train_dataloader(self):
         return DataLoader(self.TM_train, batch_size=self.batch_size,
@@ -228,69 +229,67 @@ class BaronHumanDataModule(pl.LightningDataModule):
     def prepare_data(self):
         # download
         if not os.path.exists(f"{self.data_dir}/{self.data_name}"):
-            print("Start downloading Baron Human!")
-            url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/BaronHuman.zip'
-            download_and_extract_archive(
-                url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
+          print("Start downloading Baron Human!")
+          url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/BaronHuman.zip'
+          download_and_extract_archive(url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
 
     def setup(self, stage):
         # Assign train/val datasets for use in dataloaders
 
-        DataPath = self.data_dir + "/" + self.data_name + \
-            "/Filtered_Baron_HumanPancreas_data.csv"
+        DataPath = self.data_dir + "/" + self.data_name + "/Filtered_Baron_HumanPancreas_data.csv"
         LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
+        print("loading..." + self.data_dir + "/" + self.data_name + "/CV_folds.RData")
+        rf = robjects.r['load'](self.data_dir + "/" + self.data_name + "/CV_folds.RData")
 
-        # Step #1: Read in all labels
-        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
-        full_labels = np.asarray(labels)
-        labels = None
+        with localconverter(robjects.default_converter + pandas2ri.converter):
+          test_idx = robjects.conversion.rpy2py(robjects.r['Test_Idx'])
+          train_idx = robjects.conversion.rpy2py(robjects.r['Train_Idx'])
+          cells_to_keep = robjects.conversion.rpy2py(robjects.r['Cells_to_Keep'])
 
-        # Step #2: Preprocess data and only keep cells with population larger than 10
-        remaining_labels, discarded_indices = preprocess_data(full_labels)
+        # Step #1: Read in all labels and keep cells with count > 10
+        cells_to_keep = np.array(cells_to_keep, dtype=bool)
+        full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(full_labels)
 
-        # Step #3: Turning string class labels into int labels and store the mapping
+        remaining_labels = full_labels[cells_to_keep].ravel()
+
+        # Step #2: Turning string class labels into int labels and store the mapping
         self.label_mapping = preprocessing.LabelEncoder()
         self.label_mapping.fit(remaining_labels)
-        int_labels = self.label_mapping.transform(remaining_labels)
 
+        int_labels = self.label_mapping.transform(remaining_labels)
         full_labels = np.asarray(int_labels)
+
         remaining_labels = None
         int_labels = None
 
-        # Step #4: Read in data based on selected label indices
-        discarded_indices = [x + 1 for x in discarded_indices]
-        data = pd.read_csv(DataPath, index_col=0, sep=',',
-                           skiprows=discarded_indices)
-        discarded_indices = None
+        # Step #3: Read in data based on selected label indices
+        data = pd.read_csv(DataPath, index_col=0, sep=',')
         full_data = np.asarray(data, dtype=np.float32)
-        full_dataset = CustomDataset(full_data, full_labels)
+        full_data = full_data[cells_to_keep]
 
-        self.Baron_Human_database, self.Baron_Human_train, self.Baron_Human_val, self.Baron_Human_test = split_test_train_val_database_sets(full_dataset,
-                                                                                                        train_percentage=TRAIN_SPLIT,
-                                                                                                        val_percentage=VAL_SPLIT,
-                                                                                                        test_percentage=TEST_SPLIT)
+        full_dataset = CustomDataset(data=full_data, labels=full_labels)
+        test_idx = np.array(test_idx[0]) - 1
+        train_idx = np.array(train_idx[0]) - 1
 
-        self.database_dataloader = None # Deprecated
-
+        self.Baron_Human_test = Subset(full_dataset, test_idx)
+        self.Baron_Human_train, self.Baron_Human_val = split_train_val_database_sets(full_dataset, train_idx, train_percentage=0.75)
         print("train size =", len(self.Baron_Human_train))
         print("val size =", len(self.Baron_Human_val))
         print("test size =", len(self.Baron_Human_test))
 
         # Calculate sample count in each class for training dataset
-        samples_in_each_class_dict = Counter(
-            [data[1] for data in self.Baron_Human_train])
+        samples_in_each_class_dict = Counter([data[1] for data in self.Baron_Human_train])
         print("training samples in each class =", samples_in_each_class_dict)
-        samples_in_each_class_dict_val = Counter(
-            [data[1] for data in self.Baron_Human_val])
+        samples_in_each_class_dict_val = Counter([data[1] for data in self.Baron_Human_val])
         print("val samples in each class =", samples_in_each_class_dict_val)
-        samples_in_each_class_dict_test = Counter(
-            [data[1] for data in self.Baron_Human_test])
+        samples_in_each_class_dict_test = Counter([data[1] for data in self.Baron_Human_test])
         print("test samples in each class =", samples_in_each_class_dict_test)
         self.N_CLASS = len(samples_in_each_class_dict)
         print("Changing N_CLASS =", self.N_CLASS)
         self.samples_in_each_class = torch.zeros(self.N_CLASS)
         for index, count in samples_in_each_class_dict.items():
-            self.samples_in_each_class[index] = count
+           self.samples_in_each_class[index] = count
 
     def train_dataloader(self):
         return DataLoader(self.Baron_Human_train, batch_size=self.batch_size,
@@ -307,7 +306,7 @@ class BaronHumanDataModule(pl.LightningDataModule):
 
 class Zheng68KDataModule(pl.LightningDataModule):
 
-    def __init__(self, data_dir: str = './data', batch_size=64, num_workers=2, import_size=1.0):
+    def __init__(self, data_dir: str = './data', batch_size=64, num_workers=2, import_size=0.4, fold_num=0):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -317,6 +316,7 @@ class Zheng68KDataModule(pl.LightningDataModule):
         self.label_mapping = None
         self.N_FEATURES = 20387
         self.N_CLASS = 11
+        self.fold_num = fold_num # fold_num 可以是 0-4
 
     def prepare_data(self):
         # download
@@ -330,57 +330,58 @@ class Zheng68KDataModule(pl.LightningDataModule):
 
         DataPath = self.data_dir + "/" + self.data_name + "/Filtered_68K_PBMC_data.csv"
         LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
-        
-        # Step #1: Read in all labels
-        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
-        full_labels = np.asarray(labels)
-        labels = None
 
-        # Step #2: Preprocess data and only keep cells with population larger than 10
-        remaining_labels, discarded_indices = preprocess_data(full_labels, self.import_size)
+        rf = robjects.r['load'](self.data_dir + "/" + self.data_name + "/CV_folds.RData")
 
-        # Step #3: Turning string class labels into int labels and store the mapping
+        with localconverter(robjects.default_converter + pandas2ri.converter):
+          test_idx = robjects.conversion.rpy2py(robjects.r['Test_Idx'])
+          train_idx = robjects.conversion.rpy2py(robjects.r['Train_Idx'])
+          cells_to_keep = robjects.conversion.rpy2py(robjects.r['Cells_to_Keep'])
+
+        # Step #1: Read in all labels and keep cells with count > 10
+        cells_to_keep = np.array(cells_to_keep, dtype=bool)
+        full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(full_labels)
+
+        remaining_labels = full_labels[cells_to_keep].ravel()
+
+        # Step #2: Turning string class labels into int labels and store the mapping
         self.label_mapping = preprocessing.LabelEncoder()
         self.label_mapping.fit(remaining_labels)
-        int_labels = self.label_mapping.transform(remaining_labels)
 
+        int_labels = self.label_mapping.transform(remaining_labels)
         full_labels = np.asarray(int_labels)
+
         remaining_labels = None
         int_labels = None
 
-        # Step #4: Read in data based on selected label indices
-        discarded_indices = [x + 1 for x in discarded_indices]
-        data = pd.read_csv(DataPath, index_col=0, sep=',', skiprows=discarded_indices)
-        discarded_indices = None
+        # Step #3: Read in data based on selected label indices
+        data = pd.read_csv(DataPath, index_col=0, sep=',')
         full_data = np.asarray(data, dtype=np.float32)
-        full_dataset = CustomDataset(full_data, full_labels)
+        full_data = full_data[cells_to_keep]
 
-        # Step #5: Split indices in stratified way into train, validation, test and database sets 
-        #          and prepare all datasets based on splited list indices
-        self.Zheng_68K_database, self.Zheng_68K_train, self.Zheng_68K_val, self.Zheng_68K_test = split_test_train_val_database_sets(full_dataset, 
-                                                                                                        train_percentage=TRAIN_SPLIT,
-                                                                                                        val_percentage=VAL_SPLIT,
-                                                                                                        test_percentage=TEST_SPLIT)
-        
-        self.database_dataloader = None # Deprecated
-         
+        full_dataset = CustomDataset(data=full_data, labels=full_labels)
+        test_idx = np.array(test_idx[self.fold_num]) - 1
+        train_idx = np.array(train_idx[self.fold_num]) - 1
+
+        self.Zheng_68K_test = Subset(full_dataset, test_idx)
+        self.Zheng_68K_train, self.Zheng_68K_val = split_train_val_database_sets(full_dataset, train_idx, train_percentage=0.95)
         print("train size =", len(self.Zheng_68K_train))
         print("val size =", len(self.Zheng_68K_val))
         print("test size =", len(self.Zheng_68K_test))
-        
+
         # Calculate sample count in each class for training dataset
         samples_in_each_class_dict = Counter([data[1] for data in self.Zheng_68K_train])
-        print("training samples in each class =", sorted(samples_in_each_class_dict.items()))
+        print("training samples in each class =", samples_in_each_class_dict)
         samples_in_each_class_dict_val = Counter([data[1] for data in self.Zheng_68K_val])
-        print("val samples in each class =", sorted(samples_in_each_class_dict_val.items()))
+        print("val samples in each class =", samples_in_each_class_dict_val)
         samples_in_each_class_dict_test = Counter([data[1] for data in self.Zheng_68K_test])
-        print("test samples in each class =", sorted(samples_in_each_class_dict_test.items()))
+        print("test samples in each class =", samples_in_each_class_dict_test)
         self.N_CLASS = len(samples_in_each_class_dict)
         print("Changing N_CLASS =", self.N_CLASS)
         self.samples_in_each_class = torch.zeros(self.N_CLASS)
         for index, count in samples_in_each_class_dict.items():
            self.samples_in_each_class[index] = count
-
 
     def train_dataloader(self):
         return DataLoader(self.Zheng_68K_train, batch_size=self.batch_size,
@@ -420,52 +421,47 @@ class AMBDataModule(pl.LightningDataModule):
         DataPath = self.data_dir + "/" + self.data_name + "/Filtered_mouse_allen_brain_data.csv"
         LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
 
-        # Step #1: Read in all labels
+        rf = robjects.r['load'](self.data_dir + "/" + self.data_name + "/CV_folds.RData")
+
+        with localconverter(robjects.default_converter + pandas2ri.converter):
+          test_idx = robjects.conversion.rpy2py(robjects.r['Test_Idx'])
+          train_idx = robjects.conversion.rpy2py(robjects.r['Train_Idx'])
+          cells_to_keep = robjects.conversion.rpy2py(robjects.r['Cells_to_Keep'])
+
+        # Step #1: Read in all labels and keep cells with count > 10
+        cells_to_keep = np.array(cells_to_keep, dtype=bool)
+
         if self.annotation_level == 92:
-          labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',', usecols = ['cluster'])
+          full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',', usecols = ['cluster'])
         elif self.annotation_level == 16:
-          labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',', usecols = ['Subclass'])
+          full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',', usecols = ['Subclass'])
         else:
-          labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',', usecols = ['Class'])
+          full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',', usecols = ['Class'])
           
-        full_labels = np.asarray(labels)
-        labels = None
+        full_labels = np.asarray(full_labels)
+        remaining_labels = full_labels[cells_to_keep].ravel()
 
-        # Step #2: Preprocess data and only keep cells with population larger than 10
-        remaining_labels, discarded_indices = preprocess_data(full_labels)
-
-        # Step #3: Turning string class labels into int labels and store the mapping
+        # Step #2: Turning string class labels into int labels and store the mapping
         self.label_mapping = preprocessing.LabelEncoder()
         self.label_mapping.fit(remaining_labels)
-        int_labels = self.label_mapping.transform(remaining_labels)
 
+        int_labels = self.label_mapping.transform(remaining_labels)
         full_labels = np.asarray(int_labels)
+
         remaining_labels = None
         int_labels = None
 
-        # Step #4: Read in data based on selected label indices
-        discarded_indices = [x + 1 for x in discarded_indices]
-        data = pd.read_csv(DataPath, index_col=0, sep=',', skiprows=discarded_indices)
-        discarded_indices = None
+        # Step #3: Read in data based on selected label indices
+        data = pd.read_csv(DataPath, index_col=0, sep=',')
         full_data = np.asarray(data, dtype=np.float32)
-        full_dataset = CustomDataset(full_data, full_labels)
+        full_data = full_data[cells_to_keep]
 
-        label_mapping = dict()
-        for i in range(len(self.label_mapping.classes_)):
-          label_mapping[i] = self.label_mapping.classes_[i]
+        full_dataset = CustomDataset(data=full_data, labels=full_labels)
+        test_idx = np.array(test_idx[0]) - 1
+        train_idx = np.array(train_idx[0]) - 1
 
-        print("Label name to integer mappings:", label_mapping)
-
-        for i in range (5):
-          print(full_dataset[i])
-        
-        self.AMB_database, self.AMB_train, self.AMB_val, self.AMB_test = split_test_train_val_database_sets(full_dataset, 
-                                                                                                        train_percentage=TRAIN_SPLIT,
-                                                                                                        val_percentage=VAL_SPLIT,
-                                                                                                        test_percentage=TEST_SPLIT)
-
-        self.database_dataloader = None # Deprecated
-        
+        self.AMB_test = Subset(full_dataset, test_idx)
+        self.AMB_train, self.AMB_val = split_train_val_database_sets(full_dataset, train_idx, train_percentage=0.75)
         print("train size =", len(self.AMB_train))
         print("val size =", len(self.AMB_val))
         print("test size =", len(self.AMB_test))
@@ -519,37 +515,41 @@ class XinDataModule(pl.LightningDataModule):
         DataPath = self.data_dir + "/" + self.data_name + "/Filtered_Xin_HumanPancreas_data.csv"
         LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
 
-        # Step #1: Read in all labels
-        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
-        full_labels = np.asarray(labels)
-        labels = None
+        rf = robjects.r['load'](self.data_dir + "/" + self.data_name + "/CV_folds.RData")
 
-        # Step #2: Preprocess data and only keep cells with population larger than 10
-        remaining_labels, discarded_indices = preprocess_data(full_labels)
+        with localconverter(robjects.default_converter + pandas2ri.converter):
+          test_idx = robjects.conversion.rpy2py(robjects.r['Test_Idx'])
+          train_idx = robjects.conversion.rpy2py(robjects.r['Train_Idx'])
+          cells_to_keep = robjects.conversion.rpy2py(robjects.r['Cells_to_Keep'])
 
-        # Step #3: Turning string class labels into int labels and store the mapping
+        # Step #1: Read in all labels and keep cells with count > 10
+        cells_to_keep = np.array(cells_to_keep, dtype=bool)
+        full_labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(full_labels)
+
+        remaining_labels = full_labels[cells_to_keep].ravel()
+
+        # Step #2: Turning string class labels into int labels and store the mapping
         self.label_mapping = preprocessing.LabelEncoder()
         self.label_mapping.fit(remaining_labels)
-        int_labels = self.label_mapping.transform(remaining_labels)
 
+        int_labels = self.label_mapping.transform(remaining_labels)
         full_labels = np.asarray(int_labels)
+
         remaining_labels = None
         int_labels = None
 
-        # Step #4: Read in data based on selected label indices
-        discarded_indices = [x + 1 for x in discarded_indices]
-        data = pd.read_csv(DataPath, index_col=0, sep=',', skiprows=discarded_indices)
-        discarded_indices = None
+        # Step #3: Read in data based on selected label indices
+        data = pd.read_csv(DataPath, index_col=0, sep=',')
         full_data = np.asarray(data, dtype=np.float32)
-        full_dataset = CustomDataset(full_data, full_labels)
-        
-        self.Xin_database, self.Xin_train, self.Xin_val, self.Xin_test = split_test_train_val_database_sets(full_dataset, 
-                                                                                                        train_percentage=TRAIN_SPLIT,
-                                                                                                        val_percentage=VAL_SPLIT,
-                                                                                                        test_percentage=TEST_SPLIT)
+        full_data = full_data[cells_to_keep]
 
-        self.database_dataloader = None # Deprecated
+        full_dataset = CustomDataset(data=full_data, labels=full_labels)
+        test_idx = np.array(test_idx[0]) - 1
+        train_idx = np.array(train_idx[0]) - 1
 
+        self.Xin_test = Subset(full_dataset, test_idx)
+        self.Xin_train, self.Xin_val = split_train_val_database_sets(full_dataset, train_idx, train_percentage=0.75)
         print("train size =", len(self.Xin_train))
         print("val size =", len(self.Xin_val))
         print("test size =", len(self.Xin_test))
@@ -577,4 +577,381 @@ class XinDataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(self.Xin_test, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+
+# Interdataset
+class CellBenchDataModule(pl.LightningDataModule):
+
+    def __init__(self, data_dir: str = './data', batch_size=64, num_workers=2, train_set='celseq2'):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.data_name = "CellBench"
+        self.label_mapping = None
+        self.celseq2_idx = (0, 3803)
+        self.cellbench10x_idx = (3803, 4373)
+        self.train_set = train_set
+
+    def prepare_data(self):
+        # download
+        if not os.path.exists(f"{self.data_dir}/{self.data_name}"):
+          print("Start downloading CellBench!")
+          url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/CellBench.zip'
+          download_and_extract_archive(url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
+
+    def setup(self, stage):
+        # Assign train/val datasets for use in dataloaders
+
+        DataPath = self.data_dir + "/" + self.data_name + "/Combined_10x_CelSeq2_5cl_data.csv"
+        LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
+
+        # Step #1: Read in all labels
+        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(labels).ravel()
+        labels = None
+
+        # Step #2: Turning string class labels into int labels and store the mapping
+        label_mapping = preprocessing.LabelEncoder()
+        label_mapping.fit(full_labels)
+        int_labels = label_mapping.transform(full_labels)
+
+        full_labels = np.asarray(int_labels)
+        int_labels = None
+
+        # Step #3: Read in all data
+        data = pd.read_csv(DataPath, index_col=0, sep=',', header=0)
+        full_data = np.asarray(data, dtype=np.float32)
+        full_dataset = CustomDataset(full_data, full_labels)
+        
+        # Step #4: Train test split
+        if self.train_set == 'celseq2':
+          (train_start_idx, train_end_idx) = self.celseq2_idx
+          (test_start_idx, test_end_idx) = self.cellbench10x_idx
+          
+        elif self.train_set == 'cellbench10x':
+          (train_start_idx, train_end_idx) = self.cellbench10x_idx
+          (test_start_idx, test_end_idx) = self.celseq2_idx
+        else:
+          raise ValueError("Unknown training set name! Supported options are celseq2 and cellbench10x.")
+
+        
+        train_idx = list(range(train_start_idx, train_end_idx))
+        test_idx = list(range(test_start_idx, test_end_idx))
+        train_idx, val_idx = train_test_split(train_idx, train_size=0.8, 
+                                stratify=full_labels[train_start_idx: train_end_idx])
+
+        self.CellBench_train, self.CellBench_val, self.CellBench_test = (Subset(full_dataset, train_idx),
+                                                                         Subset(full_dataset, val_idx),
+                                                                         Subset(full_dataset, test_idx))
+
+        print("train size =", len(self.CellBench_train))
+        print("val size =", len(self.CellBench_val))
+        print("test size =", len(self.CellBench_test))
+
+        # Calculate sample count in each class for training dataset
+        samples_in_each_class_dict = Counter([data[1] for data in self.CellBench_train])
+        print("training samples in each class =", samples_in_each_class_dict)
+        samples_in_each_class_dict_val = Counter([data[1] for data in self.CellBench_val])
+        print("val samples in each class =", samples_in_each_class_dict_val)
+        samples_in_each_class_dict_test = Counter([data[1] for data in self.CellBench_test])
+        print("test samples in each class =", samples_in_each_class_dict_test)
+        self.N_CLASS = len(samples_in_each_class_dict)
+        print("Changing N_CLASS =", self.N_CLASS)
+        self.samples_in_each_class = torch.zeros(self.N_CLASS)
+        for index, count in samples_in_each_class_dict.items():
+           self.samples_in_each_class[index] = count
+
+    def train_dataloader(self):
+        return DataLoader(self.CellBench_train, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+        
+    def val_dataloader(self):
+        return DataLoader(self.CellBench_val, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.CellBench_test, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+class X10v2DataModule(pl.LightningDataModule):
+
+    def __init__(self, data_dir: str = './data', batch_size=64, num_workers=2):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.data_name = "10Xv2"
+        self.label_mapping = None
+        self.training_idx = (0, 6445)
+        self.testing_idx = (6445, 23154)
+
+        # Seven different test senarios indices, could be used 
+        # for extracting individual test accuracy
+        self.SM2_idx = (6445, 6697)
+        self.X10v3_idx = (6697, 9919)
+        self.CL_idx = (9919, 10172)
+        self.DR_idx = (10172, 13394)
+        self.iD_idx = (13394, 16616)
+        self.SW_idx = (16616, 19792)
+        self.X10v2_pbmc2_idx = (19792, 23154)
+
+    def prepare_data(self):
+        # download
+        if not os.path.exists(f"{self.data_dir}/{self.data_name}"):
+          print("Start downloading 10Xv2!")
+          url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/10Xv2.zip'
+          download_and_extract_archive(url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
+
+    def setup(self, stage):
+        DataPath = self.data_dir + "/" + self.data_name + "/10Xv2_pbmc1.csv"
+        LabelsPath = self.data_dir + "/" + self.data_name + "/10Xv2_pbmc1Labels.csv"
+
+        # Step #1: Read in all labels
+        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(labels).ravel()
+        labels = None
+
+        # Step #2: Turning string class labels into int labels and store the mapping
+        label_mapping = preprocessing.LabelEncoder()
+        label_mapping.fit(full_labels)
+        int_labels = label_mapping.transform(full_labels)
+
+        full_labels = np.asarray(int_labels)
+        int_labels = None
+
+        # Step #3: Read in all data
+        data = pd.read_csv(DataPath, index_col=0, sep=',', header=0)
+        full_data = np.asarray(data, dtype=np.float32)
+        full_dataset = CustomDataset(full_data, full_labels)
+        
+        # Step #4: Train test split
+        train_idx = list(range(self.training_idx[0], self.training_idx[1]))
+        test_idx = list(range(self.testing_idx[0], self.testing_idx[1]))
+        train_idx, val_idx = train_test_split(train_idx, train_size=0.8, 
+                                stratify=full_labels[self.training_idx[0]: self.training_idx[1]])
+
+        self.X10v2_train, self.X10v2_val, self.X10v2_test = (Subset(full_dataset, train_idx),
+                                                              Subset(full_dataset, val_idx),
+                                                              Subset(full_dataset, test_idx))
+        print("train size =", len(self.X10v2_train))
+        print("val size =", len(self.X10v2_val))
+        print("test size =", len(self.X10v2_test))
+
+        # Calculate sample count in each class for training dataset
+        samples_in_each_class_dict = Counter([data[1] for data in self.X10v2_train])
+        print("training samples in each class =", samples_in_each_class_dict)
+        samples_in_each_class_dict_val = Counter([data[1] for data in self.X10v2_val])
+        print("val samples in each class =", samples_in_each_class_dict_val)
+        samples_in_each_class_dict_test = Counter([data[1] for data in self.X10v2_test])
+        print("test samples in each class =", samples_in_each_class_dict_test)
+        self.N_CLASS = len(samples_in_each_class_dict)
+        print("Changing N_CLASS =", self.N_CLASS)
+        self.samples_in_each_class = torch.zeros(self.N_CLASS)
+        for index, count in samples_in_each_class_dict.items():
+           self.samples_in_each_class[index] = count
+
+    def train_dataloader(self):
+        return DataLoader(self.X10v2_train, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.X10v2_val, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.X10v2_test, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+class PancreaticDataModule(pl.LightningDataModule):
+
+    def __init__(self, data_dir: str = './data', batch_size=64, num_workers=2, test_set='xin'):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.data_name = "Pancreatic"
+        self.label_mapping = None
+        self.xin_idx = (8701, 10150)
+        self.segerstolpe_idx = (7261, 8701)
+        self.muraro_idx = (5707, 7261)
+        self.baronhuman_idx = (0, 5707)
+        self.test_set = test_set
+
+    def prepare_data(self):
+        # download
+        if not os.path.exists(f"{self.data_dir}/{self.data_name}"):
+          print("Start downloading Pancreatic datasets!")
+          url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/Pancreatic.zip'
+          download_and_extract_archive(url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
+
+    def setup(self, stage):
+        DataPath = self.data_dir + "/" + self.data_name + "/Combined_HumanPancreas_data.csv"
+        LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
+
+        # Step #1: Read in all labels
+        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(labels).ravel()
+        labels = None
+
+        # Step #2: Turning string class labels into int labels and store the mapping
+        label_mapping = preprocessing.LabelEncoder()
+        label_mapping.fit(full_labels)
+        int_labels = label_mapping.transform(full_labels)
+
+        full_labels = np.asarray(int_labels)
+        int_labels = None
+
+        # Step #3: Read in all data
+        data = pd.read_csv(DataPath, index_col=0, sep=',', header=0)
+        full_data = np.asarray(data, dtype=np.float32)
+        full_dataset = CustomDataset(full_data, full_labels)
+        
+         # Step #4: Train test split
+        if self.test_set == 'xin':
+          train_idx = list(range(self.baronhuman_idx[0], self.segerstolpe_idx[1]))
+          (test_start_idx, test_end_idx) = self.xin_idx
+        elif self.test_set == 'segerstolpe':
+          train_idx = list(range(self.baronhuman_idx[0], self.muraro_idx[1])) + list(range(self.xin_idx[0], self.xin_idx[1]))
+          (test_start_idx, test_end_idx) = self.segerstolpe_idx
+        elif self.test_set == 'muraro':
+          train_idx = list(range(self.baronhuman_idx[0], self.baronhuman_idx[1])) + list(range(self.segerstolpe_idx[0], self.xin_idx[1]))
+          (test_start_idx, test_end_idx) = self.muraro_idx
+        elif self.test_set == 'baronhuman':
+          train_idx = list(range(self.muraro_idx[0], self.xin_idx[1]))
+          (test_start_idx, test_end_idx) = self.baronhuman_idx
+        else:
+          raise ValueError("Unknown testing set name! Supported options are xin, segerstolpe, muraro and baronhuman.")
+
+        test_idx = list(range(test_start_idx, test_end_idx))
+        train_idx, val_idx = train_test_split(train_idx, train_size=0.8, 
+                                stratify=[full_labels[x] for x in train_idx])
+
+        self.Pancreatic_train, self.Pancreatic_val, self.Pancreatic_test = (Subset(full_dataset, train_idx),
+                                                                            Subset(full_dataset, val_idx),
+                                                                            Subset(full_dataset, test_idx))
+        print("train size =", len(self.Pancreatic_train))
+        print("val size =", len(self.Pancreatic_val))
+        print("test size =", len(self.Pancreatic_test))
+
+        # Calculate sample count in each class for training dataset
+        samples_in_each_class_dict = Counter([data[1] for data in self.Pancreatic_train])
+        print("training samples in each class =", samples_in_each_class_dict)
+        samples_in_each_class_dict_val = Counter([data[1] for data in self.Pancreatic_val])
+        print("val samples in each class =", samples_in_each_class_dict_val)
+        samples_in_each_class_dict_test = Counter([data[1] for data in self.Pancreatic_test])
+        print("test samples in each class =", samples_in_each_class_dict_test)
+        self.N_CLASS = len(samples_in_each_class_dict)
+        print("Changing N_CLASS =", self.N_CLASS)
+        self.samples_in_each_class = torch.zeros(self.N_CLASS)
+        for index, count in samples_in_each_class_dict.items():
+           self.samples_in_each_class[index] = count
+
+    def train_dataloader(self):
+        return DataLoader(self.Pancreatic_train, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.Pancreatic_val, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.Pancreatic_test, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+class AlignedPancreaticDataModule(pl.LightningDataModule):
+
+    def __init__(self, data_dir: str = './data', batch_size=64, num_workers=2, test_set='xin'):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.data_name = "AlignedPancreatic"
+        self.label_mapping = None
+        self.xin_idx = (8701, 10150)
+        self.segerstolpe_idx = (7261, 8701)
+        self.muraro_idx = (5707, 7261)
+        self.baronhuman_idx = (0, 5707)
+        self.test_set = test_set
+
+    def prepare_data(self):
+        # download
+        if not os.path.exists(f"{self.data_dir}/{self.data_name}"):
+          print("Start downloading Pancreatic datasets!")
+          url = 'https://github.com/Aprilhuu/Deep-Learning-in-Single-Cell-Analysis/raw/main/AlignedPancreatic.zip'
+          download_and_extract_archive(url, f"{self.data_dir}", f"{self.data_dir}", filename=self.data_name + '.zip')
+
+    def setup(self, stage):
+        DataPath = self.data_dir + "/" + self.data_name + "/Combined_HumanPancreas_data_aligned.csv"
+        LabelsPath = self.data_dir + "/" + self.data_name + "/Labels.csv"
+
+        # Step #1: Read in all labels
+        labels = pd.read_csv(LabelsPath, header=0, index_col=None, sep=',')
+        full_labels = np.asarray(labels).ravel()
+        labels = None
+
+        # Step #2: Turning string class labels into int labels and store the mapping
+        label_mapping = preprocessing.LabelEncoder()
+        label_mapping.fit(full_labels)
+        int_labels = label_mapping.transform(full_labels)
+
+        full_labels = np.asarray(int_labels)
+        int_labels = None
+
+        # Step #3: Read in all data
+        data = pd.read_csv(DataPath, index_col=0, sep=',', header=0)
+        full_data = np.asarray(data, dtype=np.float32)
+        full_dataset = CustomDataset(full_data, full_labels)
+        
+         # Step #4: Train test split
+        if self.test_set == 'xin':
+          train_idx = list(range(self.baronhuman_idx[0], self.segerstolpe_idx[1]))
+          (test_start_idx, test_end_idx) = self.xin_idx
+        elif self.test_set == 'segerstolpe':
+          train_idx = list(range(self.baronhuman_idx[0], self.muraro_idx[1])) + list(range(self.xin_idx[0], self.xin_idx[1]))
+          (test_start_idx, test_end_idx) = self.segerstolpe_idx
+        elif self.test_set == 'muraro':
+          train_idx = list(range(self.baronhuman_idx[0], self.baronhuman_idx[1])) + list(range(self.segerstolpe_idx[0], self.xin_idx[1]))
+          (test_start_idx, test_end_idx) = self.muraro_idx
+        elif self.test_set == 'baronhuman':
+          train_idx = list(range(self.muraro_idx[0], self.xin_idx[1]))
+          (test_start_idx, test_end_idx) = self.baronhuman_idx
+        else:
+          raise ValueError("Unknown testing set name! Supported options are xin, segerstolpe, muraro and baronhuman.")
+
+        test_idx = list(range(test_start_idx, test_end_idx))
+        train_idx, val_idx = train_test_split(train_idx, train_size=0.8, 
+                                stratify=[full_labels[x] for x in train_idx])
+
+        self.Pancreatic_train, self.Pancreatic_val, self.Pancreatic_test = (Subset(full_dataset, train_idx),
+                                                                            Subset(full_dataset, val_idx),
+                                                                            Subset(full_dataset, test_idx))
+        print("train size =", len(self.Pancreatic_train))
+        print("val size =", len(self.Pancreatic_val))
+        print("test size =", len(self.Pancreatic_test))
+
+        # Calculate sample count in each class for training dataset
+        samples_in_each_class_dict = Counter([data[1] for data in self.Pancreatic_train])
+        print("training samples in each class =", samples_in_each_class_dict)
+        samples_in_each_class_dict_val = Counter([data[1] for data in self.Pancreatic_val])
+        print("val samples in each class =", samples_in_each_class_dict_val)
+        samples_in_each_class_dict_test = Counter([data[1] for data in self.Pancreatic_test])
+        print("test samples in each class =", samples_in_each_class_dict_test)
+        self.N_CLASS = len(samples_in_each_class_dict)
+        print("Changing N_CLASS =", self.N_CLASS)
+        self.samples_in_each_class = torch.zeros(self.N_CLASS)
+        for index, count in samples_in_each_class_dict.items():
+           self.samples_in_each_class[index] = count
+
+    def train_dataloader(self):
+        return DataLoader(self.Pancreatic_train, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.Pancreatic_val, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.Pancreatic_test, batch_size=self.batch_size,
                           num_workers=self.num_workers)

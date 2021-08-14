@@ -11,7 +11,8 @@ from collections import Counter
 import statistics
 import pandas as pd
 import numpy as np
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics.cluster import adjusted_rand_score
 import shutil
 import fairscale
 import time
@@ -64,8 +65,10 @@ def compute_metrics(query_dataloader, net, class_num, show_time=False, use_cpu=F
       '''
       start_time_CHC = time.time()
       if use_cpu:
+        # print("Compute result using cpu")
         binaries_query, labels_query = compute_result_cpu(query_dataloader, net)
       else:
+        # print("Compute result using gpu")
         binaries_query, labels_query = compute_result(query_dataloader, net)
 
       # 根据自定义的labeling策略，得到预测的labels
@@ -74,41 +77,64 @@ def compute_metrics(query_dataloader, net, class_num, show_time=False, use_cpu=F
       CHC_duration = time.time() - start_time_CHC
       query_num = binaries_query.shape[0]
       if show_time:
-        print("  - CHC query speed with {} test data: {:.2f} queries/s".format(query_num, query_num/CHC_duration))
+        print("\n")
+        print("  - Time spent with {} test data: {:.2f}s".format(query_num, CHC_duration))
+        print("  - CHC query speed: {:.2f} queries/s".format(query_num/CHC_duration))
       
       # (1) 自定义的labeling策略的accuracy
       labeling_accuracy_CHC = compute_labeling_strategy_accuracy(labels_pred_CHC, labels_query.numpy())
       
       # (2) F1_score, average = (micro, macro, weighted)
       F1_score_weighted_average_CHC = f1_score(labels_query, labels_pred_CHC, average='weighted')
+      F1_score_macro_CHC = f1_score(labels_query, labels_pred_CHC, average='macro')
+      F1_score_micro_CHC = f1_score(labels_query, labels_pred_CHC, average='micro')
       F1_score_per_class_CHC = f1_score(labels_query, labels_pred_CHC, average=None)
 
       # (3) F1_score median
       F1_score_median_CHC = statistics.median(F1_score_per_class_CHC)
 
-      CHC_metrics = (labeling_accuracy_CHC, F1_score_weighted_average_CHC, F1_score_median_CHC, F1_score_per_class_CHC)
+      # (4) precision, recall
+      precision = precision_score(labels_query, labels_pred_CHC, average="macro")
+      recall = recall_score(labels_query, labels_pred_CHC, average="macro")
+
+      # (5) adjusted random index 
+      ari = adjusted_rand_score(labels_query, labels_pred_CHC)
+
+      CHC_metrics = (labeling_accuracy_CHC, 
+                    F1_score_weighted_average_CHC, F1_score_median_CHC, F1_score_per_class_CHC, F1_score_macro_CHC, F1_score_micro_CHC,
+                    precision, recall,
+                    ari)
 
       return CHC_metrics
 
-def test_speed(dataloader, net, size=280):
-    # get 200 data samples and evaluate them
-    data_200, labels_200 = [], []
-    net.cpu()
+def test_speed(dataloaders, net, size=280):
+    # get data samples and evaluate them
+    # Concatenate all data smaples from dataloader list
+    data, labels = None, None
+    # net.cpu()
     net.eval()
-    for img, label in dataloader:
-        if len(data_200) > 0 and data_200[0].shape[0] * len(data_200) > size:
+    for dataloader in dataloaders:
+        data_batch, labels_batch = [], []
+        if dataloader == None: 
             break
-        data_200.append(img)
-        labels_200.append(label)
-    data_200 = torch.cat(data_200)[:size]
-    labels = torch.cat(labels_200)[:size]
+        for img, label in dataloader:
+            data_batch.append(img)
+            labels_batch.append(label)
+        dataloader_data = torch.cat(data_batch)[:size]
+        dataloader_labels = torch.cat(labels_batch)[:size]
+        if data == None:
+            data = dataloader_data
+            labels = dataloader_labels
+        else:
+            data = torch.cat((data, dataloader_data))[:size]
+            labels = torch.cat((labels, dataloader_labels))[:size]
 
     # Take the average of 6 runs as to calculate query speed
     times = []
     rep_num = 6
     for i in range(rep_num):
         start_time_CHC = time.time()
-        binary_codes = (net(data_200.cpu())).data
+        binary_codes = (net(data.cuda())).data
         labels_pred_CHC = get_labels_pred_closest_hash_center(binary_codes.cpu().numpy(), labels.numpy(), net.hash_centers.numpy())
         CHC_duration = time.time() - start_time_CHC
         times.append(CHC_duration)
@@ -169,6 +195,9 @@ def get_labels_pred_closest_hash_center(query_binaries, query_labels, hash_cente
     for binary_query, label_query in zip(query_binaries, query_labels):
           dists = CalcHammingDist(binary_query, hash_centers)
           closest_class = np.argmin(dists)
+        #   m = np.min(dists)
+        #   count = np.count_nonzero(dists==m)
+        #   print("Min dist =", m, "Count =", count)
           labels_pred.append(closest_class)
     return labels_pred
 
@@ -191,7 +220,7 @@ def compute_result(dataloader, net):
     for img, label in dataloader:
         labels.append(label)
         binariy_codes.append((net(img.cuda())).data)
-    return torch.cat(binariy_codes).sign(), torch.cat(labels)
+    return torch.cat(binariy_codes).tanh(), torch.cat(labels)
 
 # 计算Binary和得到labels
 def compute_result_cpu(dataloader, net):
@@ -201,13 +230,17 @@ def compute_result_cpu(dataloader, net):
     for img, label in dataloader:
         labels.append(label.cpu())
         binariy_codes.append((net(img.cpu())).data)
-    return torch.cat(binariy_codes).sign(), torch.cat(labels)
+    return torch.cat(binariy_codes).tanh(), torch.cat(labels)
 
 
 # 计算hamming distance，B1是一组data，（一个vector），B2是一个matrix（所有database里的vector）
 def CalcHammingDist(B1, B2):
-    q = B2.shape[1]
-    distH = 0.5 * (q - np.dot(B1, B2.transpose()))
+    # q = B2.shape[1]
+    # distH = 0.5 * (q - np.dot(B1, B2.transpose()))
+    # return distH
+    B1 = np.tile(B1, (B2.shape[0], 1))
+    distH = np.abs(B1 - B2)
+    distH = distH.sum(axis=1)
     return distH
 
 
